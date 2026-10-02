@@ -58,6 +58,10 @@ data across 200+ wards and units, to estimate where the two diverged.
 
 R (tidyverse, lubridate, janitor, scales).
 
+## AI Declaration
+
+AI tools were used to build the basics of the R code, debugging, and to clean up the aesthetics of graphs. Only data structure was provided to agents for context, ensuring confidentiality was preserved.
+
 ## Note on confidentiality
 
 This project was delivered for a real health board through a student consultancy

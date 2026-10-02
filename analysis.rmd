@@ -1,1 +1,350 @@
+---
+title: "Bottle Data Analysis"
+author: "Author"
+date: "2026-07-01"
+output: html_document
+---
 
+```{r}
+# =========================================================================
+# BLOOD CULTURE BOTTLE PROCUREMENT vs CONSUMPTION RECONCILIATION
+# =========================================================================
+# KEY ASSUMPTIONS:
+#  A1. Lab extract covers the SAME period as orders (FY24/25, Apr24–Mar25).
+#  A2. Hospital B "Medical Assessment Unit" == lab "Acute R & A Unit".
+#  A3. Hospital A "Acute Medical Unit" == lab AMU + CAA bays (Combined Assessment Area).
+#  A4. Colour model: paediatric/neonatal wards consume YELLOW (1 set = 1+ yellow);
+#      adult wards (2 bottles/test) consume 1 PINK + 1 BLUE per set.
+#  A5. Microbiology/Bacteriology orders = central lab stock/QC, reported SEPARATELY
+#      (not ward waste).
+#  A6. "Variance" = ordered − consumed = net inventory change + timing + true waste
+#      + residual matching error. It is an UPPER BOUND on waste, not waste itself.
+# =========================================================================
+
+setwd("./data")
+library(tidyverse)
+library(lubridate)
+library(janitor)
+library(scales)
+library(readr)
+
+orders_raw <- read_csv("Blood Culture Bottles usage 2024-25.csv", show_col_types = FALSE)
+lab_raw    <- read_csv("No Of Tests by Location Code and Test Name.csv", show_col_types = FALSE)
+
+# =========================================================================
+# HELPERS
+# =========================================================================
+std_hosp <- function(h) {
+  h <- str_to_upper(str_squish(h))
+  case_when(
+    h %in% c("SITE4A", "SITE4B", "SITE4C")  ~ "SITE4",
+    h %in% c("H@H", "COMMUNITY")            ~ "COMMUNITY/H@H",
+    h == "SITE1/SITE2"                      ~ "LABS",
+    is.na(h) | h == "NA"                    ~ NA_character_,
+    TRUE                                    ~ h
+  )
+}
+
+# Canonical ward key (hospital passed for context; returns KEY only)
+make_ward_key <- function(hosp, ward) {
+  wl    <- str_squish(str_to_lower(ward))
+  wl_np <- str_squish(str_remove_all(wl, "\\(.*?\\)"))     # drop parentheticals
+  num   <- str_extract(wl, "\\d+[a-z]?")                   # 118, 19a, 52 ...
+  case_when(
+    # ---- Site 1 named units ----
+    hosp=="SITE1" & str_detect(wl,"emergency department|a&e|a & e|resus|triage|immediate care|examination a|ed pod|ed observation|gp interface|accident|major incident|\\bmiu\\b") ~ "EMERGENCY DEPARTMENT",
+    hosp=="SITE1" & str_detect(wl,"acute medical|\\bamu\\b|\\bcaa\\b|combined assess")     ~ "ACUTE MEDICAL / CAA",
+    hosp=="SITE1" & str_detect(wl,"surgical assess|surgical observ")                       ~ "SURGICAL ASSESSMENT",
+    hosp=="SITE1" & str_detect(wl,"neonatal")                                              ~ "NEONATAL UNIT",
+    hosp=="SITE1" & str_detect(wl,"labour")                                                ~ "LABOUR SUITE",
+    hosp=="SITE1" & str_detect(wl,"major trauma")                                          ~ "MAJOR TRAUMA WARD",
+    # ---- Site 2 named units ----
+    hosp=="SITE2" & str_detect(wl,"medical assessment|acute r ?& ?a|arau")                 ~ "MEDICAL ASSESSMENT UNIT",
+    hosp=="SITE2" & str_detect(wl,"surgical admission|surgical assessment")                ~ "SURGICAL ADMISSIONS UNIT",
+    hosp=="SITE2" & str_detect(wl,"cancer assessment")                                     ~ "CANCER ASSESSMENT UNIT",
+    hosp=="SITE2" & str_detect(wl,"\\bsdec\\b")                                            ~ "SDEC",
+    # ---- Site 3 named units ----
+    hosp=="SITE3" & str_detect(wl,"emergency department|emergency care|a&e|accident|\\becc\\b") ~ "A&E",
+    hosp=="SITE3" & str_detect(wl,"\\bmau\\b|medical assessment|emerg.*medical|emergency medical|\\bema\\b") ~ "MEDICAL ASSESSMENT UNIT",
+    hosp=="SITE3" & str_detect(wl,"intensive therapy|\\bitu\\b")                           ~ "INTENSIVE THERAPY UNIT",
+    hosp=="SITE3" & str_detect(wl,"high dependency|\\bhdu\\b")                             ~ "HDU",
+    hosp=="SITE3" & str_detect(wl,"labour")                                                ~ "LABOUR WARD",
+    # ---- Site 4 (paediatric) named units ----
+    hosp=="SITE4" & str_detect(wl,"emergency|accident")                                    ~ "EMERGENCY DEPARTMENT",
+    hosp=="SITE4" & str_detect(wl,"intensive care|critical care")                          ~ "CRITICAL CARE",
+    hosp=="SITE4" & str_detect(wl,"ward d1")                                                ~ "WARD D1",
+    hosp=="SITE4" & str_detect(wl,"ward d2|paru")                                           ~ "WARD D2",
+    hosp=="SITE4" & str_detect(wl,"ward d3")                                                ~ "WARD D3",
+    hosp=="SITE4" & str_detect(wl,"ward d4")                                                ~ "WARD D4",
+    hosp=="SITE4" & str_detect(wl,"ward d5")                                                ~ "WARD D5",
+    # ---- Data-error rows ----
+    str_detect(wl,"error|maps to two wards")                                               ~ "UNALLOCATED (DATA ERROR)",
+    # ---- Numbered wards ----
+    !is.na(num)                                                                            ~ paste("WARD", str_to_upper(num)),
+    # ---- Fallback: cleaned name ----
+    TRUE ~ str_to_upper(str_remove_all(wl_np, "[[:punct:]]"))
+  )
+}
+
+# =========================================================================
+# STEP 1: CLEAN ORDERS
+# =========================================================================
+orders_clean <- orders_raw %>%
+  mutate(
+    item_code      = as.character(`Ord Line Item Code`),
+    qty            = as.numeric(`Ord Line Item Quantity`),
+    unit_price     = parse_number(`Ord Line Item Unit price`),
+    extended_price = parse_number(`Ord Line Extended Price`),
+    order_date     = dmy(`Ord Date Transmitted`),
+    bottle_type = case_when(
+      item_code == "241989" ~ "Yellow",
+      item_code == "259601" ~ "Pink",
+      item_code == "259618" ~ "Blue",
+      TRUE ~ "Unknown"
+    ),
+    bottles_ordered = case_when(
+      bottle_type == "Yellow"          ~ qty * 100,   # 2 x 50
+      bottle_type %in% c("Pink","Blue")~ qty * 50,    # 1 x 50
+      TRUE ~ NA_real_
+    ),
+    cost_per_bottle = extended_price / bottles_ordered,
+    is_lab_stock = str_detect(str_to_lower(Ward), "microbiology|bacteriology"),
+    # DQ fix: ward mis-coded to Hospital=Unknown -> SITE2
+    Hospital_fix = if_else(str_to_upper(str_squish(Hospital))=="UNKNOWN" &
+                             str_detect(str_to_lower(Ward),"surgical assess"), "SITE2", Hospital),
+    Hospital_std = if_else(is_lab_stock, "LABS", std_hosp(Hospital_fix)),
+    ward_key     = make_ward_key(Hospital_std, Ward)
+  ) %>%
+  filter(bottle_type != "Unknown")          # drops trailing blank row
+
+# =========================================================================
+# STEP 2: CLEAN LAB  (+ exclusions & paediatric flag)
+# =========================================================================
+lab_clean <- lab_raw %>%
+  mutate(
+    tests   = as.numeric(`Tests receive by lab`),
+    bpt     = as.numeric(`Bottles used per test`),
+    bottles = as.numeric(`Total bottles received`),
+    is_lab_stock = str_detect(str_to_lower(Ward), "microbiology|bacteriology"),
+    Hospital_std = if_else(is_lab_stock, "LABS", std_hosp(Hospital)),
+    ward_key     = make_ward_key(Hospital_std, Ward),
+    is_paed = Hospital_std=="SITE4" |
+      str_detect(str_to_lower(Ward),"neonatal|children|paediatric|special care baby|mother and baby|scbu")
+  ) %>%
+  filter(
+    Location != "Total", !is.na(Hospital_std),
+    !Hospital_std %in% c("QA","ERROR","MISC"),
+    !str_detect(str_to_lower(paste(Ward, Location)), "mds failure|not known|neqas")
+  )
+
+# =========================================================================
+# STEP 3: COLOUR-LEVEL RECONCILIATION  (join-free, most robust finding)
+# =========================================================================
+colour_used <- lab_clean %>% filter(!is_lab_stock) %>%
+  summarise(
+    Yellow = sum(if_else(is_paed, bottles, 0), na.rm=TRUE),
+    adult  = sum(if_else(is_paed, 0, bottles), na.rm=TRUE)
+  ) %>% mutate(Pink = adult/2, Blue = adult/2) %>% select(Yellow, Pink, Blue) %>%
+  pivot_longer(everything(), names_to="bottle_type", values_to="used")
+
+colour_ordered <- orders_clean %>% filter(!is_lab_stock) %>%
+  group_by(bottle_type) %>% summarise(ordered = sum(bottles_ordered), .groups="drop")
+
+colour_cost <- orders_clean %>% group_by(bottle_type) %>%
+  summarise(cost_per_bottle = sum(extended_price)/sum(bottles_ordered), .groups="drop")
+
+colour_recon <- colour_ordered %>%
+  left_join(colour_used, by="bottle_type") %>%
+  left_join(colour_cost, by="bottle_type") %>%
+  mutate(
+    variance      = ordered - used,
+    order_to_use  = ordered / used,
+    variance_gbp  = variance * cost_per_bottle
+  )
+
+# =========================================================================
+# STEP 4: HOSPITAL-LEVEL VARIANCE  (from RAW totals -> robust to ward names)
+# =========================================================================
+hosp_ordered <- orders_clean %>% filter(!is_lab_stock, Hospital_std!="MISC") %>%
+  group_by(Hospital_std) %>%
+  summarise(bottles_ordered = sum(bottles_ordered), spend = sum(extended_price), .groups="drop")
+
+hosp_used <- lab_clean %>% filter(!is_lab_stock) %>%
+  group_by(Hospital_std) %>%
+  summarise(bottles_used = sum(bottles), tests = sum(tests), .groups="drop")
+
+hospital_variance <- full_join(hosp_ordered, hosp_used, by="Hospital_std") %>%
+  replace_na(list(bottles_ordered=0, spend=0, bottles_used=0, tests=0)) %>%
+  mutate(variance = bottles_ordered - bottles_used,
+         order_to_use = na_if(bottles_ordered / bottles_used, Inf))
+
+# =========================================================================
+# STEP 5: WARD-LEVEL RECONCILIATION via crosswalk + MATCH-RATE KPI
+# =========================================================================
+weighted_cost <- with(orders_clean, sum(extended_price)/sum(bottles_ordered))  # global £/bottle
+
+orders_ward <- orders_clean %>% filter(!is_lab_stock, Hospital_std!="MISC") %>%
+  group_by(Hospital_std, ward_key) %>%
+  summarise(bottles_ordered=sum(bottles_ordered), spend=sum(extended_price), .groups="drop")
+
+lab_ward <- lab_clean %>% filter(!is_lab_stock) %>%
+  group_by(Hospital_std, ward_key) %>%
+  summarise(bottles_used=sum(bottles), tests=sum(tests), .groups="drop")
+
+ward_join <- full_join(orders_ward, lab_ward, by=c("Hospital_std","ward_key")) %>%
+  replace_na(list(bottles_ordered=0, spend=0, bottles_used=0, tests=0)) %>%
+  mutate(
+    status = case_when(
+      bottles_ordered>0 & bottles_used>0 ~ "Matched",
+      bottles_ordered>0                  ~ "Order-only (no lab match)",
+      TRUE                               ~ "Lab-only (no order match)"
+    ),
+    variance      = bottles_ordered - bottles_used,
+    order_to_use  = na_if(bottles_ordered / bottles_used, Inf),
+    variance_gbp  = variance * weighted_cost,
+    Location      = paste(Hospital_std, ward_key, sep=" | ")
+  )
+
+match_rate <- ward_join %>% group_by(status) %>%
+  summarise(n_wards=n(),
+            bottles_ordered=sum(bottles_ordered),
+            bottles_used=sum(bottles_used), .groups="drop")
+
+pct_ordered_matched <- with(ward_join,
+  sum(bottles_ordered[status=="Matched"]) / sum(bottles_ordered) * 100)
+
+# =========================================================================
+# STEP 6: PLOTS
+# =========================================================================
+theme_rep <- theme_minimal() + theme(plot.title=element_text(face="bold"))
+col_fill  <- c("Blue"="dodgerblue","Pink"="lightpink","Yellow"="gold")
+
+# P1 – Demand: top 10 busiest wards (corrected labels)
+top_demand <- lab_ward %>% slice_max(bottles_used, n=10) %>%
+  mutate(Location=paste(Hospital_std, ward_key, sep=" | "))
+p1 <- ggplot(top_demand, aes(reorder(Location,bottles_used), bottles_used)) +
+  geom_col(fill="steelblue") + coord_flip() + scale_y_continuous(labels=comma) +
+  labs(title="1. Demand: Top 10 Wards by Bottles Consumed",
+       subtitle="Clinical baseline (lab-recorded usage)", x=NULL, y="Bottles used") + theme_rep
+
+# P2 – Supply over time (DODGED, so Pink vs Blue is comparable)
+monthly_orders <- orders_clean %>% filter(!is_lab_stock) %>%
+  mutate(order_month=floor_date(order_date,"month")) %>%
+  group_by(order_month, bottle_type) %>%
+  summarise(total_bottles=sum(bottles_ordered), .groups="drop") %>% drop_na(order_month)
+p2 <- ggplot(monthly_orders, aes(order_month, total_bottles, fill=bottle_type)) +
+  geom_col(position="dodge") + scale_fill_manual(values=col_fill) +
+  scale_y_continuous(labels=comma) + scale_x_date(date_breaks="2 months", date_labels="%b %y") +
+  labs(title="2. Supply: Bottles Ordered per Month by Colour",
+       subtitle="Dodged bars expose Pink vs Blue balance & procurement spikes",
+       x="Order month", y="Bottles ordered", fill="Bottle type") + theme_rep
+
+# P3 – Colour reconciliation: ordered vs consumed (KEY chart)
+p3 <- colour_recon %>% select(bottle_type, Ordered=ordered, Consumed=used) %>%
+  pivot_longer(-bottle_type, names_to="measure", values_to="bottles") %>%
+  ggplot(aes(bottle_type, bottles, fill=measure)) +
+  geom_col(position="dodge") +
+  geom_text(aes(label=comma(round(bottles))), position=position_dodge(0.9), vjust=-0.4, size=3) +
+  scale_y_continuous(labels=comma) +
+  scale_fill_manual(values=c("Ordered"="grey40","Consumed"="seagreen")) +
+  labs(title="3. Colour Reconciliation: Ordered vs Consumed",
+       subtitle="Yellow=paediatric; adult sets need 1 Pink + 1 Blue (should be ~equal)",
+       x=NULL, y="Bottles", fill=NULL) + theme_rep
+
+# P4 – Pink vs Blue balance over time (imbalance = guaranteed waste)
+p4 <- monthly_orders %>% filter(bottle_type %in% c("Pink","Blue")) %>%
+  ggplot(aes(order_month, total_bottles, fill=bottle_type)) +
+  geom_col(position="dodge") + scale_fill_manual(values=col_fill) +
+  scale_y_continuous(labels=comma) + scale_x_date(date_breaks="2 months", date_labels="%b %y") +
+  labs(title="4. Adult Set Balance: Pink vs Blue Ordered",
+       subtitle="Persistent gaps cannot be used clinically -> waste of the surplus colour",
+       x="Order month", y="Bottles ordered", fill="Bottle type") + theme_rep
+
+# P5 – Price trend per bottle by colour
+price_trend <- orders_clean %>% mutate(order_month=floor_date(order_date,"month")) %>%
+  group_by(order_month, bottle_type) %>%
+  summarise(cpb=sum(extended_price)/sum(bottles_ordered), .groups="drop") %>% drop_na(order_month)
+p5 <- ggplot(price_trend, aes(order_month, cpb, colour=bottle_type)) +
+  geom_line(linewidth=1) + geom_point() + scale_colour_manual(values=col_fill) +
+  scale_y_continuous(labels=dollar_format(prefix="£")) +
+  scale_x_date(date_breaks="2 months", date_labels="%b %y") +
+  labs(title="5. Unit Cost Trend per Bottle", subtitle="Mid-year price uplift by colour",
+       x="Order month", y="Cost per bottle", colour="Bottle type") + theme_rep
+
+# P6 – Hospital variance (net, from raw totals; can be + or -)
+p6 <- hospital_variance %>% filter(bottles_ordered>0 | bottles_used>0) %>%
+  ggplot(aes(reorder(Hospital_std, variance), variance, fill=variance>0)) +
+  geom_col() +
+  geom_text(aes(label=comma(variance)), hjust=-0.1, size=3) +
+  coord_flip() +
+  scale_y_continuous(labels=comma,
+                     expand = expansion(mult = c(0.05, 0.15))) +
+  scale_fill_manual(values=c("TRUE"="coral","FALSE"="steelblue"),
+                    labels=c("TRUE"="Over-supplied","FALSE"="Under-supplied"), name=NULL) +
+  labs(title="6. Net Procurement Variance by Hospital",
+       subtitle="Ordered − Consumed (positive = potential over-supply)",
+       x=NULL, y="Net bottle variance") + theme_rep
+
+# P7 – Pareto: matched wards with largest over-supply
+top_waste <- ward_join %>% filter(status=="Matched", variance>0) %>%
+  slice_max(variance_gbp, n=10)
+p7 <- ggplot(top_waste, aes(reorder(Location, variance_gbp), variance_gbp)) +
+  geom_col(fill="darkred", alpha=.85) + coord_flip() +
+  geom_text(aes(label=dollar(variance_gbp, prefix="£", accuracy=1)), hjust=-0.1, size=3) +
+  scale_y_continuous(labels=dollar_format(prefix="£")) +
+  labs(title="7. Matched Wards: Largest Over-Supply (£)",
+       subtitle="Only wards reconciled across both systems (excludes join artefacts)",
+       x=NULL, y="Estimated variance value") + theme_rep +
+  expand_limits(y=max(top_waste$variance_gbp)*1.2)
+
+# P8 – Order-to-use ratio (efficiency), matched wards with material usage
+top_ratio <- ward_join %>% filter(status=="Matched", bottles_used>=100) %>%
+  slice_max(order_to_use, n=10)
+p8 <- ggplot(top_ratio, aes(reorder(Location, order_to_use), order_to_use)) +
+  geom_col(fill="orange3") + coord_flip() +
+  geom_hline(yintercept=1, linetype="dashed") +
+  geom_text(aes(label=scales::number(order_to_use, accuracy=0.1)), hjust=-0.1, size=3) +
+  labs(title="8. Over-Ordering Index (Order ÷ Use)",
+       subtitle="1.0 = perfectly matched; ≥1.3 flags over-ordering (usage ≥100 bottles)",
+       x=NULL, y="Order-to-use ratio") + theme_rep + expand_limits(y=max(top_ratio$order_to_use)*1.15)
+
+# =========================================================================
+# STEP 7: SUPPORTING TABLES (spikes, lab stock, DQ register)
+# =========================================================================
+order_spikes <- orders_clean %>% slice_max(bottles_ordered, n=8) %>%
+  select(order_date, Hospital_std, ward_key, bottle_type, qty, bottles_ordered, extended_price)
+
+lab_stock_orders <- orders_clean %>% filter(is_lab_stock) %>%
+  summarise(lines=n(), bottles=sum(bottles_ordered), spend=sum(extended_price))
+
+dq_register <- tribble(
+  ~issue, ~detail,
+  "Dual-mapped ward code", "Order rows tagged to two wards -> 'UNALLOCATED (DATA ERROR)'",
+  "Hospital=Unknown", "Surgical Assessment Unit orders reassigned to SITE2",
+  "Lab 'Total' row", "Removed",
+  "QA/NEQAS, MDS Failure, Not Known, Misc", "Excluded from clinical demand",
+  "Microbiology/Bacteriology", "Treated as central lab stock; reported separately",
+  "Assumption A3 (AMU=CAA)", "SITE1 Acute Medical Unit mapped to AMU+CAA bays"
+)
+
+# =========================================================================
+# STEP 8: OUTPUT
+# =========================================================================
+print(p1); print(p2); print(p3); print(p4); print(p5); print(p6); print(p7); print(p8)
+
+net_bottles <- sum(hospital_variance$variance)
+net_gbp     <- sum(colour_recon$variance_gbp)
+matched_surplus_gbp <- sum(ward_join$variance_gbp[ward_join$status=="Matched" & ward_join$variance>0])
+
+cat("\n================= EXECUTIVE SUMMARY =================\n")
+cat("Tests processed (lab):           ", comma(sum(lab_ward$tests)), "\n")
+cat("Bottles consumed (lab):          ", comma(sum(lab_ward$bottles_used)), "\n")
+cat("Bottles ordered (clinical):      ", comma(sum(orders_ward$bottles_ordered)), "\n")
+cat("Bottles ordered (central lab):   ", comma(lab_stock_orders$bottles),
+    " (£", comma(round(lab_stock_orders$spend)), ")\n", sep="")
+cat("----------------------------------------------------\n")
+cat("NET variance (ordered−consumed): ", comma(net_bottles),
+    " bottles  |  £", comma(round(net_gbp)), "\n", sep="")
+cat("  (positive = net over-supply; negative = stock drawn down)\n")
+cat("Ward match rate (by ordered £/vol):", round(pct_ordered_matched,1), "% of ordered bottles reconciled\n")
+cat("Matched-ward over-supply (upper bound of waste): £", comma(round(matched_surplus_gbp)), "\n", sep="")
